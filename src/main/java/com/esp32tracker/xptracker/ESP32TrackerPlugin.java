@@ -1,6 +1,5 @@
 package com.esp32tracker.xptracker;
 
-import com.google.gson.Gson;
 import com.google.inject.Provides;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
@@ -19,15 +18,15 @@ import net.runelite.client.plugins.xptracker.XpTrackerService;
 import okhttp3.*;
 
 import java.io.IOException;
+import java.util.concurrent.TimeUnit;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
 @Slf4j
 @PluginDescriptor(
 		name = "ESP32 XP Tracker",
-		description = "Sends real-time XP tracking data to an ESP32 device with TFT display.",
-		tags = {"xp", "tracker", "esp32", "hardware", "iot"},
+		description = "Sends real-time XP tracking data to an ESP32 device with TFT display. Displays skill progress, XP/hour, actions/hour, and time to level on external hardware.",
+		tags = {"xp", "tracker", "esp32", "display", "hardware", "iot"},
 		enabledByDefault = false
 )
 @PluginDependency(XpTrackerPlugin.class)
@@ -42,26 +41,22 @@ public class ESP32TrackerPlugin extends Plugin
 	@Inject
 	private XpTrackerService xpTrackerService;
 
-	private final OkHttpClient httpClient = new OkHttpClient.Builder()
-			.connectTimeout(5, TimeUnit.SECONDS)
-			.writeTimeout(5, TimeUnit.SECONDS)
-			.readTimeout(5, TimeUnit.SECONDS)
-			.build();
+	@Inject
+	private OkHttpClient httpClient; // Injected
 
-	private final Gson gson = new Gson();
+	@Inject
+	private com.google.gson.Gson gson; // Injected
 
-	private Skill lastSkill;
-	private long lastUpdateTime;
-
-	private static final long UPDATE_DELAY_MS = 1000;
-
-	private boolean pendingUpdate;
-	private Skill pendingSkill;
+	private Skill lastSkill = null;
+	private long lastUpdateTime = 0;
+	private static final long UPDATE_DELAY_MS = 1000; // 1 per second
+	private boolean pendingUpdate = false;
+	private Skill pendingSkill = null;
 
 	private final Map<Skill, Integer> skillStartXp = new HashMap<>();
 
 	@Override
-	protected void startUp()
+	protected void startUp() throws Exception
 	{
 		if (!config.esp32IpAddress().isEmpty())
 		{
@@ -70,16 +65,15 @@ public class ESP32TrackerPlugin extends Plugin
 	}
 
 	@Override
-	protected void shutDown()
+	protected void shutDown() throws Exception
 	{
 		lastSkill = null;
-		skillStartXp.clear();
 	}
 
 	@Subscribe
-	public void onGameStateChanged(GameStateChanged event)
+	public void onGameStateChanged(GameStateChanged gameStateChanged)
 	{
-		if (event.getGameState() == GameState.LOGIN_SCREEN)
+		if (gameStateChanged.getGameState() == GameState.LOGIN_SCREEN)
 		{
 			lastSkill = null;
 			skillStartXp.clear();
@@ -87,44 +81,22 @@ public class ESP32TrackerPlugin extends Plugin
 	}
 
 	@Subscribe
-	public void onStatChanged(StatChanged event)
+	public void onStatChanged(StatChanged statChanged)
 	{
-		Skill skill = event.getSkill();
-
+		Skill skill = statChanged.getSkill();
 		if (skill == Skill.OVERALL || isSkillIgnored(skill))
 		{
 			return;
 		}
 
-		skillStartXp.putIfAbsent(skill, client.getSkillExperience(skill));
+		if (!skillStartXp.containsKey(skill))
+		{
+			skillStartXp.put(skill, client.getSkillExperience(skill));
+		}
+
 		lastSkill = skill;
 		pendingUpdate = true;
 		pendingSkill = skill;
-	}
-
-	@Subscribe
-	public void onGameTick(net.runelite.api.events.GameTick tick)
-	{
-		if (config.esp32IpAddress().isEmpty())
-		{
-			return;
-		}
-
-		Skill skill = pendingUpdate ? pendingSkill : lastSkill;
-		if (skill == null)
-		{
-			return;
-		}
-
-		long now = System.currentTimeMillis();
-		if (now - lastUpdateTime < UPDATE_DELAY_MS)
-		{
-			return;
-		}
-
-		lastUpdateTime = now;
-		sendToESP32(buildSkillData(skill));
-		pendingUpdate = false;
 	}
 
 	private boolean isSkillIgnored(Skill skill)
@@ -159,10 +131,27 @@ public class ESP32TrackerPlugin extends Plugin
 		}
 	}
 
+	@Subscribe
+	public void onGameTick(net.runelite.api.events.GameTick gameTick)
+	{
+		if (config.esp32IpAddress().isEmpty()) return;
+
+		Skill skillToUpdate = pendingUpdate ? pendingSkill : lastSkill;
+		if (skillToUpdate == null) return;
+
+		long currentTime = System.currentTimeMillis();
+		if (currentTime - lastUpdateTime < UPDATE_DELAY_MS) return;
+		lastUpdateTime = currentTime;
+
+		ESP32SkillData skillData = buildSkillData(skillToUpdate);
+		sendToESP32(skillData);
+
+		pendingUpdate = false;
+	}
+
 	private ESP32SkillData buildSkillData(Skill skill)
 	{
 		ESP32SkillData data = new ESP32SkillData();
-
 		int currentXp = client.getSkillExperience(skill);
 		int currentLevel = client.getRealSkillLevel(skill);
 
@@ -170,43 +159,65 @@ public class ESP32TrackerPlugin extends Plugin
 		data.xp = currentXp;
 		data.level = currentLevel;
 		data.boosted_level = client.getBoostedSkillLevel(skill);
+
 		data.xp_hr = xpTrackerService.getXpHr(skill);
 		data.actions_hr = xpTrackerService.getActionsHr(skill);
 		data.time_to_level = xpTrackerService.getTimeTilGoal(skill);
 
-		int startXp = skillStartXp.getOrDefault(skill, currentXp);
-		data.xp_gained = currentXp - startXp;
+		Integer startXp = skillStartXp.get(skill);
+		data.xp_gained = (startXp != null) ? currentXp - startXp : 0;
+
+		if (currentLevel < 99)
+		{
+			int currentLevelMinXp = net.runelite.api.Experience.getXpForLevel(currentLevel);
+			int nextLevelXp = net.runelite.api.Experience.getXpForLevel(currentLevel + 1);
+			data.progress_percent = (float)(currentXp - currentLevelMinXp) / (nextLevelXp - currentLevelMinXp) * 100f;
+		}
+		else
+		{
+			data.progress_percent = 100f;
+		}
 
 		return data;
 	}
 
 	private void sendToESP32(ESP32SkillData data)
 	{
-		String url = "http://" + config.esp32IpAddress() + "/update";
+		String url = String.format("http://%s/update", config.esp32IpAddress());
+		String json = gson.toJson(data);
 
+		// ✅ Corrected for OkHttp 4.x
 		RequestBody body = RequestBody.create(
-				MediaType.parse("application/json"),
-				gson.toJson(data)
+				MediaType.get("application/json"),
+				json
 		);
 
-		Request request = new Request.Builder().url(url).post(body).build();
+		Request request = new Request.Builder()
+				.url(url)
+				.post(body)
+				.build();
+
 		httpClient.newCall(request).enqueue(new Callback()
 		{
-			public void onFailure(Call call, IOException ignored) {}
+			@Override
+			public void onFailure(Call call, IOException e) { }
+
+			@Override
 			public void onResponse(Call call, Response response) { response.close(); }
 		});
 	}
 
 	private void testConnection()
 	{
-		Request request = new Request.Builder()
-				.url("http://" + config.esp32IpAddress() + "/")
-				.get()
-				.build();
+		String url = String.format("http://%s/", config.esp32IpAddress());
+		Request request = new Request.Builder().url(url).get().build();
 
 		httpClient.newCall(request).enqueue(new Callback()
 		{
-			public void onFailure(Call call, IOException ignored) {}
+			@Override
+			public void onFailure(Call call, IOException e) { }
+
+			@Override
 			public void onResponse(Call call, Response response) { response.close(); }
 		});
 	}
@@ -227,5 +238,6 @@ public class ESP32TrackerPlugin extends Plugin
 		int actions_hr;
 		int xp_gained;
 		String time_to_level;
+		float progress_percent;
 	}
 }
