@@ -27,7 +27,6 @@ import java.util.Map;
 		name = "ESP32 XP Tracker",
 		description = "Sends real-time XP tracking data to an ESP32 device with TFT display. Displays skill progress, XP/hour, actions/hour, and time to level on external hardware.",
 		tags = {"xp", "tracker", "esp32", "display", "hardware", "iot"}
-
 )
 @PluginDependency(XpTrackerPlugin.class)
 public class ESP32TrackerPlugin extends Plugin
@@ -84,7 +83,7 @@ public class ESP32TrackerPlugin extends Plugin
 	public void onStatChanged(StatChanged statChanged)
 	{
 		Skill skill = statChanged.getSkill();
-		if (skill == Skill.OVERALL || isSkillIgnored(skill))
+		if (isSkillIgnored(skill))
 		{
 			return;
 		}
